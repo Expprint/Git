@@ -1,0 +1,314 @@
+# Giftwrap Generator — UX Implementation Plan
+
+This plan describes how to deliver the UX shown in `Pattern_Gen_UX.png` into a functional Next.js app: interactive preview types (canvas, full-screen, box), a Layers panel with background removal / transform / delete, asset upload, and “Export” to a Shopify pipeline.
+
+---
+
+## 0) Repo Snapshot (Current State)
+
+- Stack: Next.js 14 + React 18 + Tailwind (configured), TypeScript.
+- S3 presign helper present: `GWS/giftwrap-generator/lib/s3.ts:1`.
+- Basic canvas generator stub present: `GWS/giftwrap-generator/lib/generator.ts:1` (naive white BG removal, no tiling/transform logic yet).
+- `app/` directory is empty; UI and API routes are not created yet.
+- README describes presign endpoints and upload pages that don’t yet exist.
+
+Implication: We’ll scaffold the `app` routes and UI, then build rendering, layer tooling, and export.
+
+---
+
+## 1) Product Goals (MVP)
+
+- Interactive editor with:
+  - Background color control.
+  - Pattern controls for tiling density/offset.
+  - Asset upload to S3 and layer management.
+  - Per-layer actions: remove background, move/resize (transform), delete.
+  - Preview Type: normal canvas view, full-screen preview, 3D box preview.
+- Export: Generate final pattern tile PNG and send to Shopify pipeline; return a success link/ID.
+
+Non-goals (MVP): multi-user collaboration, complex vector editing, offline persistence.
+
+---
+
+## 1.1) Preferences (Confirmed)
+
+- Export tile: 2048×2028 PNG, target 300 DPI metadata.
+- Shopify pipeline: redirect to your site’s add-to-cart path (e.g. `https://giftwrap.studio/pages/add-design?variant=...&qty=1&preview=<url>&params=<b64>`). No Admin API integration required initially.
+- Background removal: robust option first (U2Net via `onnxruntime-web`), with a lightweight threshold fallback.
+
+Notes
+- Browser canvas PNGs don’t include DPI by default; we can add a pHYs 300 DPI chunk server-side in the Export API (optional but supported in this plan).
+
+---
+
+## 2) Architecture Overview
+
+- Client (Next.js App Router): React components for editor, layers, previews, and export.
+- Rendering: HTML5 Canvas for 2D tiling; Three.js for box preview.
+- Storage: Direct-to-S3 via presigned PUT (public-read). Presign created by API route.
+- Export: API route accepts final PNG (data URL), stores to S3, then redirects or responds with a URL to your Shopify add-to-cart page containing `preview` and encoded `params`.
+
+Key modules
+- `lib/generator.ts`: Extend to support tiling, transforms, and export rendering.
+- `lib/s3.ts`: Already provides presign; reuse for uploads and export storage.
+
+---
+
+## 3) Data Model
+
+```
+type LayerId = string;
+
+interface Transform2D {
+  x: number;       // px offset from tile origin
+  y: number;       // px offset from tile origin
+  scale: number;   // uniform scale factor
+  rotation: number; // radians
+}
+
+interface Layer {
+  id: LayerId;
+  name?: string;
+  url: string;          // public S3 URL
+  thumbUrl?: string;    // optional thumb (can reuse url)
+  removeBg: boolean;
+  transform: Transform2D;
+  locked?: boolean;
+  hidden?: boolean;
+}
+
+interface DesignState {
+  bgColor: string;         // e.g. #1F2A63
+  pattern: {
+    tileWidth: number;     // px, export/base resolution (default 2048)
+    tileHeight: number;    // px, export/base resolution (default 2028)
+    repeatX: number;       // columns of repeated tile in preview
+    repeatY: number;       // rows in preview
+    offsetX: number;       // px shift per row/column (for brick/half-step)
+    offsetY: number;
+  };
+  layers: Layer[];
+  selectedId?: LayerId;
+  previewType: 'canvas' | 'fullscreen' | 'box';
+}
+```
+
+State management: use `useReducer` for deterministic updates and undo/redo later. No extra libs required.
+
+---
+
+## 4) Milestones & Tasks
+
+### M1 — App Scaffolding & Style (0.5–1 day)
+
+- Add Tailwind base file and layout.
+  - `app/globals.css`
+  - `app/layout.tsx` with Geist font (already in deps) and base theme.
+- Create editor shell with two panes: preview (left) and controls (right) matching the UX.
+  - `app/page.tsx` renders editor.
+
+Deliverable: Page loads with static UI chrome and disabled controls.
+
+### M2 — S3 Presign API + Upload UI (0.5 day)
+
+- Create API route for presign using `lib/s3.ts`.
+  - `app/api/s3/presign/route.ts`
+  - POST JSON: `{ filename, contentType }` → `{ uploadUrl, publicUrl }`.
+- Build `Upload` button that:
+  - Requests presign, then `PUT` file with headers: `Content-Type` and `x-amz-acl: public-read`.
+  - On success, adds new Layer with defaults `{ removeBg: false, transform: {x:0,y:0,scale:1,rotation:0} }`.
+
+Deliverable: Users can upload images and see them as layer rows with thumbnails.
+
+### M3 — Renderer: Tiling & Transforms (1.5–2 days)
+
+- Extend `lib/generator.ts`:
+  - Add transform-aware draw per layer: apply translate/rotate/scale before `drawImage`.
+  - Implement tiling: render a single `tileWidth x tileHeight` tile offscreen, then compose repeats in preview.
+  - Support pattern parameters: `repeatX`, `repeatY`, `offsetX/Y` for brick/half-step.
+  - Keep `removeWhiteBg` as a baseline provider for `removeBg`.
+- Create `components/PreviewCanvas.tsx`:
+  - Renders the repeated preview in the editor panel.
+  - Supports panning with mouse/touch (preview only; tile origin remains fixed for export).
+- Add background color slider (HSL gradient UI) + hex input; update state.
+
+Deliverable: Users see live updates of color, tiling, and transforms.
+
+### M4 — Layer Controls (1–1.5 days)
+
+- `components/LayerList.tsx` showing each layer row with:
+  - Thumbnail + selection highlight.
+  - Buttons: Remove BG, Transform, Delete.
+- Remove BG button:
+  - Toggle `removeBg` in state; apply during render.
+  - Prepare pluggable providers (see M7) via `REMOVE_BG_PROVIDER` env.
+- Transform button:
+  - Enable transform mode in preview: show bounding box + handles.
+  - Implement drag (x/y), pinch/scroll for scale, rotate handle. Keyboard: `Esc` exits, `Del` deletes.
+- Delete button:
+  - Remove layer and reselect next available.
+
+Deliverable: Full layer interaction flows are usable.
+
+### M5 — Preview Type Switching (0.5–1 day)
+
+- Normal canvas (default): already present from M3.
+- Full-screen preview:
+  - `components/FullscreenPreview.tsx` modal overlay; reuses renderer to fill viewport.
+  - Triggered by “Preview Type” control; `Esc` to exit.
+- Box preview:
+  - Add `three` and `@react-three/fiber` (or plain `three` if preferred) and `drei` for controls.
+  - `components/BoxPreview.tsx` renders 3D box with the tile as a texture; add controls for tile scale/repeat on material.
+  - Compute tile texture from the same offscreen tile renderer for consistency.
+
+Deliverable: Users can switch between the three preview modes.
+
+### M6 — Export to Shopify Pipeline (1–2 days)
+
+- Client: `Export` button generates final tile PNG from offscreen canvas at `tileWidth × tileHeight` resolution (default 2048×2028).
+  - Ensure export matches rectangular aspect.
+  - Post to API route with `{ dataUrl, designMeta }`.
+- API `app/api/export/route.ts`:
+  1) Decode data URL → Buffer.
+  2) Store to S3 under `exports/<uuid>.png` using `PutObjectCommand` (or server-side presigned PUT).
+  3) Optionally set PNG 300 DPI metadata (pHYs chunk) using a Node PNG library.
+  4) Construct add-to-cart URL, e.g. `SHOPIFY_ADD_DESIGN_URL + '?variant=' + VARIANT + '&qty=1&preview=' + encodeURIComponent(s3Url) + '&params=' + params_b64`.
+  5) Return `{ ok, s3Url, redirectUrl }` (client may redirect) or respond with 303 redirect.
+
+Environment variables (documented in README):
+- `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` (already used).
+- `SHOPIFY_ADD_DESIGN_URL` (e.g., `https://giftwrap.studio/pages/add-design`).
+- `SHOPIFY_DEFAULT_VARIANT_ID` (if you use a constant variant), otherwise pass from client according to product selection.
+
+Deliverable: Export returns success plus a ready-to-open `redirectUrl` that adds the generated design to cart.
+
+### M7 — Background Removal Providers (0.5–1 day)
+
+- Keep `removeWhiteBg` baseline in `lib/generator.ts`.
+- Add provider interface:
+  - `none` | `threshold` | `onnx_u2net` | `external_api`.
+  - Default provider: `onnx_u2net` using `onnxruntime-web` (robust).
+    - Host model at `public/models/u2net.onnx` (or quantized variant for size/perf).
+    - Run inference in a Web Worker; return alpha matte and compose on canvas.
+    - Fallback to `threshold` when ONNX not supported.
+  - `external_api` can call a server route that proxies a paid service; disabled unless env set.
+- UI exposes “Remove BG” as a simple toggle; provider choice is set by `REMOVE_BG_PROVIDER` env.
+
+Deliverable: Pluggable background removal with a safe default.
+
+### M8 — Polish & QA (0.5–1 day)
+
+- Keyboard shortcuts: `Del` delete, `Esc` exit transform.
+- Snap-to-grid option during transform for precise alignment.
+- Persist last design to `localStorage` and allow reloading.
+- Accessibility: focus states, ARIA labels for all buttons.
+- Error handling: upload failures, large images, Shopify errors.
+
+---
+
+## 5) File/Folder Plan
+
+- `app/layout.tsx` — global layout, fonts, `<body>` structure.
+- `app/globals.css` — Tailwind base.
+- `app/page.tsx` — main editor shell.
+- `components/PreviewCanvas.tsx` — 2D preview and transform UI.
+- `components/FullscreenPreview.tsx` — full-screen modal.
+- `components/BoxPreview.tsx` — 3D preview using Three.js.
+- `components/LayerList.tsx` — layer rows with actions and thumbnails.
+- `components/ControlsPanel.tsx` — right-side panel (color, pattern, upload, export).
+- `app/api/s3/presign/route.ts` — returns `{ uploadUrl, publicUrl }`.
+- `app/api/export/route.ts` — accepts dataURL, stores to S3, calls Shopify.
+  - Responds with `{ redirectUrl }` to open the add-to-cart page.
+- `lib/generator.ts` — extend to tiling/transforms and a `renderTilePNG()` helper.
+- `lib/s3.ts` — already present; add helpers for server-side put if desired.
+- `types/design.ts` — share `Layer`, `DesignState`, etc.
+
+---
+
+## 6) UI Wiring (Key Flows)
+
+- Upload → Presign → PUT → Add Layer
+  1) User selects file.
+  2) Client calls `/api/s3/presign` with filename + contentType.
+  3) PUT to `uploadUrl` with headers. On 200, use returned `publicUrl`.
+  4) Add Layer and select it.
+
+- Remove BG Toggle
+  - Toggle `layer.removeBg`; re-render tile.
+
+- Transform Mode
+  - Select layer → click Transform → handles appear over preview.
+  - Drag/rotate/scale updates `layer.transform` continuously.
+  - Commit on mouseup; keyboard `Esc` cancels.
+
+- Preview Type
+  - Toggle cycles: canvas ↔ full-screen ↔ box.
+  - State persists; full-screen closes on `Esc` or “close”.
+
+- Export Flow
+  - Client calls `renderTilePNG()` to get final tile DataURL (2048×2028).
+  - POST `{ dataUrl, meta }` to `/api/export`.
+  - Receive `{ redirectUrl }` and navigate user to Shopify add-to-cart page.
+
+---
+
+## 7) Shopify Export Details
+
+Option A — Files API (recommended simple pipeline)
+1) Server uploads PNG to S3 `exports/`.
+2) Call Shopify GraphQL staged upload → `filesCreate` with the S3 URL.
+3) Response returns file ID/URL to show to the user.
+
+Option B — Existing custom pipeline
+- If you already have a webhook or app endpoint, have `/api/export` POST `{ s3Url, meta }` to it.
+
+Security
+- Keep Admin token server-side only.
+- CORS: only allow same-origin calls to our API routes.
+
+---
+
+## 8) Acceptance Criteria (MVP)
+
+- Uploads work; new layers appear with thumbnails.
+- Background color changes re-render instantly.
+- Pattern tiling reflects repeat and offset settings.
+- Layer actions:
+  - Remove BG: toggles transparent background for white areas.
+  - Transform: drag/scale/rotate with visible handles; cancel with Esc.
+  - Delete: removes the layer and updates selection.
+- Preview Type switching among 3 modes works and is visually correct.
+- Export posts final tile to backend, stores on S3, and returns a link or Shopify ID.
+
+---
+
+## 9) Open Questions / Assumptions
+
+- Exact tile export size? Proposal: 2048×2048 PNG (configurable).
+- Desired default tiling (repeat counts) in preview? Proposal: 3×4 grid.
+- Shopify pipeline specifics: Do you want Files, Product Images, or a custom asset store? Provide the endpoint/GraphQL mutation if fixed.
+- Background removal provider: OK to start with threshold; later enable onnx or external API?
+- Any licensing constraints for third-party libs (`three`, `@react-three/fiber`)?
+
+---
+
+## 10) Rough Estimates
+
+- M1–M2: 1.0–1.5 days
+- M3–M5: 3.0–4.0 days (rendering, transforms, previews)
+- M6: 1.0–2.0 days (export + Shopify integration)
+- M7–M8: 1.0–1.5 days (providers + polish)
+
+Total: ~6–9 days for MVP depending on export integration specifics.
+
+---
+
+## 11) Next Steps (What I’ll Implement First)
+
+1) Scaffold `app/` pages and API routes for presign and export.
+2) Add editor shell (`page.tsx`) and Tailwind styles.
+3) Implement upload flow and layer list.
+4) Extend generator for transforms + tiling and wire Preview Canvas.
+5) Add Preview Type switching, then export route.
+
+This sequence yields a usable editor quickly and isolates Shopify export for focused integration and testing.
